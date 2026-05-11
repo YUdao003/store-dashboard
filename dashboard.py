@@ -89,6 +89,20 @@ TEXT_COLOR = "#334155"
 GRID_COLOR = "#e2e8f0"
 
 
+def hex_to_rgba(hex_color: str, alpha: float = 0.25) -> str:
+    """安全地把 #RRGGBB 转成 rgba(r,g,b,a)；任何异常都返回中性灰。"""
+    try:
+        h = str(hex_color).lstrip("#")
+        if len(h) == 3:
+            h = "".join(c * 2 for c in h)
+        if len(h) >= 6:
+            r = int(h[0:2], 16); g = int(h[2:4], 16); b = int(h[4:6], 16)
+            return f"rgba({r},{g},{b},{alpha})"
+    except Exception:
+        pass
+    return f"rgba(100,116,139,{alpha})"
+
+
 # ── 数据加载 ──────────────────────────────────────────────────────────────────
 def load_meituan(file) -> pd.DataFrame:
     if isinstance(file, str):
@@ -1099,37 +1113,43 @@ font-size:12px;color:#475569;margin:8px 0;'>
             radar_data   = [p[1] for p in radar_pairs]
 
         col_l, col_r = st.columns([2, 1])
+        store_color = str(row.get("_color") or "#64748b")
+        if not store_color.startswith("#"):
+            store_color = "#64748b"
         with col_l:
             if radar_data:
-                fig_radar = go.Figure(go.Scatterpolar(
-                    r=radar_data + [radar_data[0]],
-                    theta=radar_labels + [radar_labels[0]],
-                    fill="toself",
-                    fillcolor=row["_color"] + "33",
-                    line=dict(color=row["_color"], width=2),
-                    marker=dict(color=row["_color"], size=8),
-                ))
-                fig_radar.update_layout(
-                    polar=dict(
-                        radialaxis=dict(visible=True, range=[0, 100], gridcolor=GRID_COLOR,
-                                        tickfont=dict(color=TEXT_COLOR, size=10)),
-                        angularaxis=dict(tickfont=dict(color=TEXT_COLOR, size=12)),
-                        bgcolor="#fff",
-                    ),
-                    paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
-                    font=dict(color=TEXT_COLOR),
-                    height=400, margin=dict(l=40, r=40, t=40, b=40),
-                    showlegend=False,
-                )
-                st.plotly_chart(fig_radar, width='stretch')
+                try:
+                    fig_radar = go.Figure(go.Scatterpolar(
+                        r=radar_data + [radar_data[0]],
+                        theta=radar_labels + [radar_labels[0]],
+                        fill="toself",
+                        fillcolor=hex_to_rgba(store_color, 0.25),
+                        line=dict(color=store_color, width=2),
+                        marker=dict(color=store_color, size=8),
+                    ))
+                    fig_radar.update_layout(
+                        polar=dict(
+                            radialaxis=dict(visible=True, range=[0, 100], gridcolor=GRID_COLOR,
+                                            tickfont=dict(color=TEXT_COLOR, size=10)),
+                            angularaxis=dict(tickfont=dict(color=TEXT_COLOR, size=12)),
+                            bgcolor="#fff",
+                        ),
+                        paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
+                        font=dict(color=TEXT_COLOR),
+                        height=400, margin=dict(l=40, r=40, t=40, b=40),
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig_radar, width='stretch')
+                except Exception as e:
+                    st.warning(f"雷达图渲染失败：{e}")
         with col_r:
             st.markdown(f"""
-<div style='background:#fff;border:1px solid #e2e8f0;border-left:4px solid {row['_color']};
+<div style='background:#fff;border:1px solid #e2e8f0;border-left:4px solid {store_color};
 border-radius:10px;padding:16px 20px;margin-top:30px;'>
 <div style='font-size:13px;color:#64748b;margin-bottom:4px;'>{row['平台']}</div>
 <div style='font-size:16px;font-weight:700;color:#0f172a;margin-bottom:8px;'>{row['门店']}</div>
-<div style='font-size:32px;font-weight:700;color:{row['_color']};margin-bottom:4px;'>{row['综合评分']:.1f}</div>
-<div style='font-size:14px;color:{row['_color']};margin-bottom:12px;'>{row['等级']}</div>
+<div style='font-size:32px;font-weight:700;color:{store_color};margin-bottom:4px;'>{row['综合评分']:.1f}</div>
+<div style='font-size:14px;color:{store_color};margin-bottom:12px;'>{row['等级']}</div>
 <hr style='border:none;border-top:1px solid #e2e8f0;'>
 <div style='font-size:12px;color:#64748b;'>各维度得分：</div>
 """ + "".join([
