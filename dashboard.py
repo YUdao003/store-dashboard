@@ -990,14 +990,14 @@ with tab3:
             with cols[i]:
                 color = PLATFORM_COLORS.get(plat, "#888")
                 st.markdown(f"""
-                <div style='background:{color}1A;border-left:4px solid {color};
-                padding:10px 16px;border-radius:6px;margin-bottom:8px;'>
-                    <b style='color:#0f172a;font-size:16px;'>🏷 {plat}</b>
-                    <span style='color:#64748b;font-size:12px;margin-left:10px;'>
-                    {sub['门店名称'].nunique()} 家门店 · {len(sub):,} 条记录
-                    </span>
-                </div>
-                """, unsafe_allow_html=True)
+<div style='background:{color}1A;border-left:4px solid {color};
+padding:10px 16px;border-radius:6px;margin-bottom:8px;'>
+<b style='color:#0f172a;font-size:16px;'>🏷 {plat}</b>
+<span style='color:#64748b;font-size:12px;margin-left:10px;'>
+{sub['门店名称'].nunique()} 家门店 · {len(sub):,} 条记录
+</span>
+</div>
+""", unsafe_allow_html=True)
 
                 # 平台级 KPI
                 p_exp = sub["曝光人数"].sum()
@@ -1085,33 +1085,43 @@ font-size:12px;color:#475569;margin:8px 0;'>
         row = store_options.iloc[sel_idx]
         radar_cols = ["营收规模", "下单转化", "进店转化", "流量类型",
                       "利润率", "补贴ROI", "退单率", "新客占比"]
-        radar_vals = [row.get(c, 0) for c in radar_cols]
-        radar_labels = [c for c, v in zip(radar_cols, radar_vals) if v is not None and not pd.isna(v)]
-        radar_data = [v if v is not None and not pd.isna(v) else 0 for v in radar_vals]
+        # 只保留该店真正有得分的维度，labels 和 data 长度对齐
+        radar_pairs = []
+        for c in radar_cols:
+            v = row.get(c)
+            if v is not None and not pd.isna(v):
+                radar_pairs.append((c, float(v)))
+        if len(radar_pairs) < 3:
+            st.info("该店可对比维度不足，无法绘制雷达图")
+            radar_labels, radar_data = [], []
+        else:
+            radar_labels = [p[0] for p in radar_pairs]
+            radar_data   = [p[1] for p in radar_pairs]
 
         col_l, col_r = st.columns([2, 1])
         with col_l:
-            fig_radar = go.Figure(go.Scatterpolar(
-                r=radar_data + [radar_data[0]],
-                theta=radar_labels + [radar_labels[0]],
-                fill="toself",
-                fillcolor=row["_color"] + "33",
-                line=dict(color=row["_color"], width=2),
-                marker=dict(color=row["_color"], size=8),
-            ))
-            fig_radar.update_layout(
-                polar=dict(
-                    radialaxis=dict(visible=True, range=[0, 100], gridcolor=GRID_COLOR,
-                                    tickfont=dict(color=TEXT_COLOR, size=10)),
-                    angularaxis=dict(tickfont=dict(color=TEXT_COLOR, size=12)),
-                    bgcolor="#fff",
-                ),
-                paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
-                font=dict(color=TEXT_COLOR),
-                height=400, margin=dict(l=40, r=40, t=40, b=40),
-                showlegend=False,
-            )
-            st.plotly_chart(fig_radar, width='stretch')
+            if radar_data:
+                fig_radar = go.Figure(go.Scatterpolar(
+                    r=radar_data + [radar_data[0]],
+                    theta=radar_labels + [radar_labels[0]],
+                    fill="toself",
+                    fillcolor=row["_color"] + "33",
+                    line=dict(color=row["_color"], width=2),
+                    marker=dict(color=row["_color"], size=8),
+                ))
+                fig_radar.update_layout(
+                    polar=dict(
+                        radialaxis=dict(visible=True, range=[0, 100], gridcolor=GRID_COLOR,
+                                        tickfont=dict(color=TEXT_COLOR, size=10)),
+                        angularaxis=dict(tickfont=dict(color=TEXT_COLOR, size=12)),
+                        bgcolor="#fff",
+                    ),
+                    paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
+                    font=dict(color=TEXT_COLOR),
+                    height=400, margin=dict(l=40, r=40, t=40, b=40),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_radar, width='stretch')
         with col_r:
             st.markdown(f"""
 <div style='background:#fff;border:1px solid #e2e8f0;border-left:4px solid {row['_color']};
@@ -1415,21 +1425,21 @@ with tab_peer:
             color = PLATFORM_COLORS.get(plat, "#888")
             with bench_cols[i]:
                 st.markdown(f"""
-                <div style='background:#fff;border:1px solid #e2e8f0;border-left:4px solid {color};
-                border-radius:10px;padding:14px 18px;margin-bottom:10px;'>
-                <div style='font-size:14px;font-weight:700;color:#0f172a;margin-bottom:10px;'>🏷 {plat} 大盘</div>
-                <table style='width:100%;font-size:13px;'>
-                <tr><td style='color:#64748b;padding:3px 0;'>下单转化率</td>
-                    <td style='text-align:right;color:#0f172a;font-weight:700;'>{b['下单转化率']*100:.2f}%</td></tr>
-                <tr><td style='color:#64748b;padding:3px 0;'>进店转化率</td>
-                    <td style='text-align:right;color:#0f172a;font-weight:700;'>{b['进店转化率']*100:.2f}%</td></tr>
-                <tr><td style='color:#64748b;padding:3px 0;'>客单价</td>
-                    <td style='text-align:right;color:#0f172a;font-weight:700;'>¥{b['客单价']:.2f}</td></tr>
-                <tr><td style='color:#94a3b8;padding:3px 0;font-size:11px;'>样本</td>
-                    <td style='text-align:right;color:#94a3b8;font-size:11px;'>{int(b['_order_total']):,} 单 / ¥{b['_rev_total']:,.0f}</td></tr>
-                </table>
-                </div>
-                """, unsafe_allow_html=True)
+<div style='background:#fff;border:1px solid #e2e8f0;border-left:4px solid {color};
+border-radius:10px;padding:14px 18px;margin-bottom:10px;'>
+<div style='font-size:14px;font-weight:700;color:#0f172a;margin-bottom:10px;'>🏷 {plat} 大盘</div>
+<table style='width:100%;font-size:13px;'>
+<tr><td style='color:#64748b;padding:3px 0;'>下单转化率</td>
+<td style='text-align:right;color:#0f172a;font-weight:700;'>{b['下单转化率']*100:.2f}%</td></tr>
+<tr><td style='color:#64748b;padding:3px 0;'>进店转化率</td>
+<td style='text-align:right;color:#0f172a;font-weight:700;'>{b['进店转化率']*100:.2f}%</td></tr>
+<tr><td style='color:#64748b;padding:3px 0;'>客单价</td>
+<td style='text-align:right;color:#0f172a;font-weight:700;'>¥{b['客单价']:.2f}</td></tr>
+<tr><td style='color:#94a3b8;padding:3px 0;font-size:11px;'>样本</td>
+<td style='text-align:right;color:#94a3b8;font-size:11px;'>{int(b['_order_total']):,} 单 / ¥{b['_rev_total']:,.0f}</td></tr>
+</table>
+</div>
+""", unsafe_allow_html=True)
 
         st.markdown(f"""
 <div style='background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:12px 16px;
