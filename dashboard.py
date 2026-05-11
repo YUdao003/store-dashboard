@@ -407,6 +407,74 @@ def compute_alerts(df, z_thresh=2.0, drop_thresh=0.30, monitor_metrics=None):
     return out
 
 
+# ── 大盘对比（门店 vs 平台基准）─────────────────────────────────────────────
+def compute_peer_comparison(df: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
+    """
+    返回:
+      - benchmarks: {平台: {下单转化率, 进店转化率, 客单价}}（加权大盘值）
+      - detail: 每个门店在每个指标上与所在平台大盘的偏离
+    """
+    benchmarks = {}
+    rows = []
+
+    for plat in df["平台"].unique():
+        sub = df[df["平台"] == plat]
+        T_ord = sub["有效订单"].sum()
+        T_vis = sub["进店人数"].sum()
+        T_exp = sub["曝光人数"].sum()
+        T_rev = sub["收入"].sum()
+
+        b_order_conv = (T_ord / T_vis) if T_vis else 0
+        b_visit_conv = (T_vis / T_exp) if T_exp else 0
+        b_aov        = (T_rev / T_ord) if T_ord else 0
+
+        benchmarks[plat] = {
+            "下单转化率": b_order_conv,
+            "进店转化率": b_visit_conv,
+            "客单价":     b_aov,
+            "_order_total": T_ord,
+            "_visit_total": T_vis,
+            "_exp_total":   T_exp,
+            "_rev_total":   T_rev,
+        }
+
+        for store, grp in sub.groupby("门店名称"):
+            s_ord = grp["有效订单"].sum()
+            s_vis = grp["进店人数"].sum()
+            s_exp = grp["曝光人数"].sum()
+            s_rev = grp["收入"].sum()
+
+            store_order_conv = (s_ord / s_vis) if s_vis else 0
+            store_visit_conv = (s_vis / s_exp) if s_exp else 0
+            store_aov        = (s_rev / s_ord) if s_ord else 0
+
+            for name, sval, bval, is_pct in [
+                ("下单转化率", store_order_conv, b_order_conv, True),
+                ("进店转化率", store_visit_conv, b_visit_conv, True),
+                ("客单价",     store_aov,        b_aov,        False),
+            ]:
+                if bval == 0:
+                    continue
+                dev = (sval - bval) / bval
+                rows.append({
+                    "门店": store, "平台": plat, "指标": name,
+                    "门店值": sval, "大盘均值": bval, "偏离": dev,
+                    "_is_pct": is_pct,
+                })
+
+    detail = pd.DataFrame(rows)
+    return benchmarks, detail
+
+
+def classify_peer_deviation(dev: float):
+    """根据偏离度返回 (标签, 颜色) - 偏低坏，偏高好"""
+    if dev <= -0.30:  return "🔴 严重偏低", "#dc2626"
+    if dev <= -0.15:  return "🟠 偏低",     "#f59e0b"
+    if dev >=  0.30:  return "🟢 标杆门店", "#10b981"
+    if dev >=  0.15:  return "🔵 表现良好", "#3b82f6"
+    return "⚪ 接近大盘", "#64748b"
+
+
 def generate_daily_report(df, report_date) -> pd.DataFrame:
     day = df[df["日期"] == pd.Timestamp(report_date)]
     if day.empty:
@@ -550,8 +618,8 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-tab1, tab2, tab3, tab_alert, tab4 = st.tabs(
-    ["📈 综合概览", "🏪 门店分析", "👥 流量分析", "⚠️ 预警监控", "📋 日报"]
+tab1, tab2, tab3, tab_alert, tab_peer, tab4 = st.tabs(
+    ["📈 综合概览", "🏪 门店分析", "👥 流量分析", "⚠️ 预警监控", "🎯 大盘对比", "📋 日报"]
 )
 
 # ── Tab 1: 综合概览 ───────────────────────────────────────────────────────────
@@ -736,6 +804,162 @@ with tab_alert:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="dl_alerts",
                 )
+
+
+# ── Tab 大盘对比: 门店 vs 平台基准 ────────────────────────────────────────────
+with tab_peer:
+    benchmarks, peer_df = compute_peer_comparison(df)
+
+    if not benchmarks:
+        st.info("当前筛选下无数据")
+    else:
+        # 顶部：各平台大盘基准卡片
+        st.markdown('<div class="section-title">各平台大盘基准</div>', unsafe_allow_html=True)
+        plat_list = list(benchmarks.keys())
+        bench_cols = st.columns(len(plat_list))
+        for i, plat in enumerate(plat_list):
+            b = benchmarks[plat]
+            color = PLATFORM_COLORS.get(plat, "#888")
+            with bench_cols[i]:
+                st.markdown(f"""
+                <div style='background:#fff;border:1px solid #e2e8f0;border-left:4px solid {color};
+                border-radius:10px;padding:14px 18px;margin-bottom:10px;'>
+                <div style='font-size:14px;font-weight:700;color:#0f172a;margin-bottom:10px;'>🏷 {plat} 大盘</div>
+                <table style='width:100%;font-size:13px;'>
+                <tr><td style='color:#64748b;padding:3px 0;'>下单转化率</td>
+                    <td style='text-align:right;color:#0f172a;font-weight:700;'>{b['下单转化率']*100:.2f}%</td></tr>
+                <tr><td style='color:#64748b;padding:3px 0;'>进店转化率</td>
+                    <td style='text-align:right;color:#0f172a;font-weight:700;'>{b['进店转化率']*100:.2f}%</td></tr>
+                <tr><td style='color:#64748b;padding:3px 0;'>客单价</td>
+                    <td style='text-align:right;color:#0f172a;font-weight:700;'>¥{b['客单价']:.2f}</td></tr>
+                <tr><td style='color:#94a3b8;padding:3px 0;font-size:11px;'>样本</td>
+                    <td style='text-align:right;color:#94a3b8;font-size:11px;'>{int(b['_order_total']):,} 单 / ¥{b['_rev_total']:,.0f}</td></tr>
+                </table>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown(f"""
+<div style='background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:12px 16px;
+font-size:12px;color:#475569;margin-bottom:8px;'>
+<b style='color:#0f172a;'>计算方式：</b>
+大盘=该平台所有门店加权平均 ·
+下单转化率=总订单/总进店 · 进店转化率=总进店/总曝光 · 客单价=总收入/总订单。
+偏离≤-30% 严重偏低 · -30%~-15% 偏低 · ±15%内 接近大盘 · ≥+15% 表现良好 · ≥+30% 标杆。
+</div>
+""", unsafe_allow_html=True)
+
+        # 指标选择
+        col_m, col_p = st.columns([2, 1])
+        with col_m:
+            sel_metric = st.radio(
+                "对比指标",
+                ["下单转化率", "进店转化率", "客单价"],
+                horizontal=True,
+                key="peer_metric",
+            )
+        with col_p:
+            sel_plat = st.selectbox(
+                "平台",
+                ["全部"] + plat_list,
+                key="peer_plat",
+            )
+
+        plot_df = peer_df[peer_df["指标"] == sel_metric].copy()
+        if sel_plat != "全部":
+            plot_df = plot_df[plot_df["平台"] == sel_plat]
+
+        if plot_df.empty:
+            st.info("无数据")
+        else:
+            plot_df["分级"] = plot_df["偏离"].apply(lambda x: classify_peer_deviation(x)[0])
+            plot_df["颜色"] = plot_df["偏离"].apply(lambda x: classify_peer_deviation(x)[1])
+            plot_df["门店短名"] = plot_df["门店"].apply(_short_store_name)
+            plot_df = plot_df.sort_values("偏离", ascending=True)
+
+            # 图表：条形图，参考线 = 大盘均值
+            is_pct = plot_df["_is_pct"].iloc[0]
+
+            fig = go.Figure()
+            for plat in plot_df["平台"].unique():
+                sub = plot_df[plot_df["平台"] == plat]
+                bench = benchmarks[plat][sel_metric]
+                if is_pct:
+                    x_vals = sub["门店值"] * 100
+                    bench_v = bench * 100
+                    suffix = "%"
+                else:
+                    x_vals = sub["门店值"]
+                    bench_v = bench
+                    suffix = ""
+                fig.add_trace(go.Bar(
+                    y=sub["门店短名"] + f" [{plat}]",
+                    x=x_vals,
+                    orientation="h",
+                    marker_color=sub["颜色"],
+                    text=[f"{v:.2f}{suffix}" for v in x_vals],
+                    textposition="outside",
+                    textfont=dict(color=TEXT_COLOR, size=11),
+                    name=plat,
+                    customdata=sub[["偏离", "分级"]],
+                    hovertemplate=(
+                        "<b>%{y}</b><br>"
+                        f"{sel_metric}: %{{x:.2f}}{suffix}<br>"
+                        "偏离大盘: %{customdata[0]:+.1%}<br>"
+                        "分级: %{customdata[1]}<extra></extra>"
+                    ),
+                ))
+                # 添加大盘参考线
+                fig.add_vline(
+                    x=bench_v,
+                    line=dict(color=PLATFORM_COLORS.get(plat, "#888"),
+                              width=2, dash="dash"),
+                    annotation_text=f"{plat} 大盘 {bench_v:.2f}{suffix}",
+                    annotation_position="top",
+                    annotation_font_color=PLATFORM_COLORS.get(plat, "#888"),
+                )
+
+            _base_layout(fig, height=max(380, len(plot_df) * 28))
+            fig.update_layout(margin=dict(l=10, r=80, t=60, b=10), showlegend=False)
+            fig.update_xaxes(gridcolor=GRID_COLOR, ticksuffix=suffix, showline=True, linecolor=GRID_COLOR)
+            fig.update_yaxes(gridcolor=GRID_COLOR, automargin=True)
+
+            st.markdown(f'<div class="section-title">{sel_metric} · 各门店 vs 大盘</div>', unsafe_allow_html=True)
+            st.plotly_chart(fig, width='stretch')
+
+            # 偏低门店（重点关注）
+            problem = plot_df[plot_df["偏离"] <= -0.15].sort_values("偏离")
+            top = plot_df[plot_df["偏离"] >= 0.15].sort_values("偏离", ascending=False)
+
+            col_l, col_r = st.columns(2)
+            with col_l:
+                st.markdown('<div class="section-title">⚠️ 偏低门店（需关注）</div>', unsafe_allow_html=True)
+                if problem.empty:
+                    st.success("✅ 所有门店在该指标上均接近或高于大盘")
+                else:
+                    show = problem[["门店", "平台", "门店值", "大盘均值", "偏离", "分级"]].copy()
+                    if is_pct:
+                        show["门店值"]  = show["门店值"].map(lambda x: f"{x*100:.2f}%")
+                        show["大盘均值"] = show["大盘均值"].map(lambda x: f"{x*100:.2f}%")
+                    else:
+                        show["门店值"]  = show["门店值"].map(lambda x: f"¥{x:.2f}")
+                        show["大盘均值"] = show["大盘均值"].map(lambda x: f"¥{x:.2f}")
+                    show["偏离"] = show["偏离"].map(lambda x: f"{x*100:+.1f}%")
+                    st.dataframe(show, width='stretch', hide_index=True)
+
+            with col_r:
+                st.markdown('<div class="section-title">🏆 标杆门店（可借鉴）</div>', unsafe_allow_html=True)
+                if top.empty:
+                    st.info("当前指标无明显标杆门店")
+                else:
+                    show = top[["门店", "平台", "门店值", "大盘均值", "偏离", "分级"]].copy()
+                    if is_pct:
+                        show["门店值"]  = show["门店值"].map(lambda x: f"{x*100:.2f}%")
+                        show["大盘均值"] = show["大盘均值"].map(lambda x: f"{x*100:.2f}%")
+                    else:
+                        show["门店值"]  = show["门店值"].map(lambda x: f"¥{x:.2f}")
+                        show["大盘均值"] = show["大盘均值"].map(lambda x: f"¥{x:.2f}")
+                    show["偏离"] = show["偏离"].map(lambda x: f"{x*100:+.1f}%")
+                    st.dataframe(show, width='stretch', hide_index=True)
 
 
 # ── Tab 4: 日报 ───────────────────────────────────────────────────────────────
