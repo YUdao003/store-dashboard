@@ -8,6 +8,12 @@ import os
 from datetime import datetime, date, timedelta
 import io
 
+from pptx import Presentation
+from pptx.util import Inches, Pt, Emu
+from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+
 st.set_page_config(
     page_title="门店运营看板",
     page_icon="🏪",
@@ -797,6 +803,335 @@ def generate_daily_report(df, report_date) -> pd.DataFrame:
     summary["进店人数"] = summary["进店人数"].map(lambda x: f"{int(x):,}")
     summary["有效订单"] = summary["有效订单"].map(lambda x: f"{int(x):,}")
     return summary.rename(columns={"门店名称": "门店"})
+
+
+# ── PPT 日报生成 ──────────────────────────────────────────────────────────────
+PPT_FONT = "微软雅黑"
+PPT_COLOR_PRIMARY  = RGBColor(0x4F, 0x46, 0xE5)  # 主色 紫
+PPT_COLOR_SUCCESS  = RGBColor(0x10, 0xB9, 0x81)  # 绿
+PPT_COLOR_WARNING  = RGBColor(0xF5, 0x9E, 0x0B)  # 橙
+PPT_COLOR_DANGER   = RGBColor(0xDC, 0x26, 0x26)  # 红
+PPT_COLOR_TEXT     = RGBColor(0x0F, 0x17, 0x2A)  # 主文字
+PPT_COLOR_SUBTEXT  = RGBColor(0x64, 0x74, 0x8B)  # 次要文字
+PPT_COLOR_LIGHTBG  = RGBColor(0xF8, 0xFA, 0xFC)  # 浅底
+PPT_COLOR_BORDER   = RGBColor(0xE2, 0xE8, 0xF0)  # 边框
+
+
+def _ppt_set_text(tf, text, size=14, bold=False, color=PPT_COLOR_TEXT,
+                  align=PP_ALIGN.LEFT, font=PPT_FONT):
+    tf.text = ""
+    p = tf.paragraphs[0]
+    p.alignment = align
+    run = p.add_run()
+    run.text = str(text)
+    run.font.name = font
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    run.font.color.rgb = color
+
+
+def _ppt_textbox(slide, x, y, w, h, text, **kwargs):
+    box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+    tf = box.text_frame
+    tf.word_wrap = True
+    tf.margin_left = Inches(0.05)
+    tf.margin_right = Inches(0.05)
+    _ppt_set_text(tf, text, **kwargs)
+    return box
+
+
+def _ppt_kpi_card(slide, x, y, w, h, label, value, accent=PPT_COLOR_PRIMARY):
+    """画一个 KPI 卡片：左边竖条 + 标签 + 大数字"""
+    # 卡片背景
+    bg = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
+                                 Inches(x), Inches(y), Inches(w), Inches(h))
+    bg.fill.solid()
+    bg.fill.fore_color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+    bg.line.color.rgb = PPT_COLOR_BORDER
+    bg.line.width = Pt(0.75)
+    bg.shadow.inherit = False
+
+    # 左侧色条
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE,
+                                  Inches(x), Inches(y), Inches(0.08), Inches(h))
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = accent
+    bar.line.fill.background()
+
+    # 标签
+    _ppt_textbox(slide, x + 0.18, y + 0.12, w - 0.25, 0.3,
+                 label, size=11, color=PPT_COLOR_SUBTEXT)
+    # 数值
+    _ppt_textbox(slide, x + 0.18, y + 0.42, w - 0.25, h - 0.5,
+                 value, size=22, bold=True, color=PPT_COLOR_TEXT)
+
+
+def _ppt_table(slide, x, y, w, h, headers, data, header_color=PPT_COLOR_PRIMARY):
+    """渲染一个简洁表格"""
+    rows = len(data) + 1
+    cols = len(headers)
+    if rows < 2:
+        return
+    table_shape = slide.shapes.add_table(rows, cols,
+                                          Inches(x), Inches(y),
+                                          Inches(w), Inches(h))
+    table = table_shape.table
+
+    # 表头
+    for ci, h_text in enumerate(headers):
+        cell = table.cell(0, ci)
+        cell.fill.solid()
+        cell.fill.fore_color.rgb = header_color
+        tf = cell.text_frame
+        _ppt_set_text(tf, h_text, size=11, bold=True,
+                       color=RGBColor(0xFF, 0xFF, 0xFF), align=PP_ALIGN.CENTER)
+
+    # 数据行
+    for ri, row in enumerate(data):
+        for ci, val in enumerate(row):
+            cell = table.cell(ri + 1, ci)
+            cell.fill.solid()
+            cell.fill.fore_color.rgb = (PPT_COLOR_LIGHTBG if ri % 2 == 0
+                                         else RGBColor(0xFF, 0xFF, 0xFF))
+            tf = cell.text_frame
+            align = PP_ALIGN.CENTER if ci > 0 else PP_ALIGN.LEFT
+            _ppt_set_text(tf, val, size=10, color=PPT_COLOR_TEXT, align=align)
+
+
+def _ppt_add_slide_header(slide, title, subtitle=""):
+    """每页顶部统一的页头"""
+    # 顶部色条
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE,
+                                  Inches(0), Inches(0), Inches(13.33), Inches(0.08))
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = PPT_COLOR_PRIMARY
+    bar.line.fill.background()
+
+    _ppt_textbox(slide, 0.4, 0.2, 12, 0.5,
+                 title, size=22, bold=True, color=PPT_COLOR_TEXT)
+    if subtitle:
+        _ppt_textbox(slide, 0.4, 0.7, 12, 0.4,
+                     subtitle, size=12, color=PPT_COLOR_SUBTEXT)
+
+
+def generate_ppt_report(df_all, report_date,
+                         alerts_df=None, traffic_alerts=None, refund_alerts=None) -> io.BytesIO:
+    """生成日报 PPT，返回 BytesIO。"""
+    prs = Presentation()
+    prs.slide_width  = Inches(13.33)
+    prs.slide_height = Inches(7.5)
+    blank = prs.slide_layouts[6]
+
+    day = df_all[df_all["日期"] == pd.Timestamp(report_date)]
+    if day.empty:
+        # 空数据兜底
+        slide = prs.slides.add_slide(blank)
+        _ppt_textbox(slide, 1, 3, 11, 1, f"{report_date} 无数据",
+                     size=28, bold=True, color=PPT_COLOR_DANGER, align=PP_ALIGN.CENTER)
+        buf = io.BytesIO()
+        prs.save(buf); buf.seek(0); return buf
+
+    # ── 数据汇总 ───────────────────────────────────
+    total_rev = day["收入"].sum()
+    total_ord = day["有效订单"].sum()
+    total_exp = day["曝光人数"].sum() if "曝光人数" in day.columns else 0
+    total_vis = day["进店人数"].sum() if "进店人数" in day.columns else 0
+    avg_price = (total_rev / total_ord) if total_ord else 0
+    overall_conv = (total_ord / total_vis) if total_vis else 0
+    store_cnt = day["门店名称"].nunique()
+
+    plat_summary = day.groupby("平台").agg(
+        营收=("收入", "sum"),
+        订单=("有效订单", "sum"),
+        曝光=("曝光人数", "sum"),
+        进店=("进店人数", "sum"),
+    ).reset_index()
+    plat_summary["客单价"] = plat_summary["营收"] / plat_summary["订单"].replace(0, np.nan)
+    plat_summary["下单转化"] = plat_summary["订单"] / plat_summary["进店"].replace(0, np.nan)
+
+    store_rank = day.groupby(["门店名称", "平台"]).agg(
+        营收=("收入", "sum"),
+        订单=("有效订单", "sum"),
+    ).reset_index().sort_values("营收", ascending=False)
+
+    # ── Slide 1：封面 ──────────────────────────────
+    slide = prs.slides.add_slide(blank)
+    # 整页彩色背景
+    bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE,
+                                 Inches(0), Inches(0), Inches(13.33), Inches(7.5))
+    bg.fill.solid()
+    bg.fill.fore_color.rgb = PPT_COLOR_PRIMARY
+    bg.line.fill.background()
+
+    _ppt_textbox(slide, 0.8, 1.8, 12, 1,
+                 "门店运营日报", size=44, bold=True,
+                 color=RGBColor(0xFF, 0xFF, 0xFF))
+    _ppt_textbox(slide, 0.8, 2.8, 12, 0.6,
+                 f"📅 {report_date}", size=20,
+                 color=RGBColor(0xE0, 0xE7, 0xFF))
+
+    # 三大核心数字
+    _ppt_textbox(slide, 0.8, 4.0, 12, 0.4,
+                 "今日核心数据", size=14,
+                 color=RGBColor(0xC7, 0xD2, 0xFE))
+
+    def _cover_metric(x, label, value):
+        _ppt_textbox(slide, x, 4.5, 4, 0.4, label, size=13,
+                      color=RGBColor(0xC7, 0xD2, 0xFE))
+        _ppt_textbox(slide, x, 4.9, 4, 0.9, value, size=36, bold=True,
+                      color=RGBColor(0xFF, 0xFF, 0xFF))
+
+    _cover_metric(0.8, "总营业收入", fmt_money(total_rev))
+    _cover_metric(5.0, "总有效订单", f"{int(total_ord):,} 单")
+    _cover_metric(9.2, "活跃门店",   f"{store_cnt} 家")
+
+    _ppt_textbox(slide, 0.8, 6.8, 12, 0.4,
+                 "本报告由门店运营监控看板自动生成", size=10,
+                 color=RGBColor(0xC7, 0xD2, 0xFE), align=PP_ALIGN.LEFT)
+
+    # ── Slide 2：核心指标 + 平台对比 ────────────────
+    slide = prs.slides.add_slide(blank)
+    _ppt_add_slide_header(slide, "📊 核心指标概览",
+                           f"{report_date} | {store_cnt} 家活跃门店")
+
+    # 5 个 KPI 卡
+    card_w = 2.4; card_h = 1.4; gap = 0.15
+    start_x = 0.4; start_y = 1.4
+    for i, (label, value, accent) in enumerate([
+        ("总营业收入", fmt_money(total_rev), PPT_COLOR_PRIMARY),
+        ("总有效订单", f"{int(total_ord):,}", PPT_COLOR_SUCCESS),
+        ("加权客单价", f"¥{avg_price:.2f}", PPT_COLOR_PRIMARY),
+        ("总曝光人数", f"{int(total_exp):,}", PPT_COLOR_WARNING),
+        ("整体下单转化", f"{overall_conv*100:.1f}%", PPT_COLOR_SUCCESS),
+    ]):
+        x = start_x + i * (card_w + gap)
+        _ppt_kpi_card(slide, x, start_y, card_w, card_h, label, value, accent)
+
+    # 平台对比表
+    _ppt_textbox(slide, 0.4, 3.2, 12, 0.4,
+                 "平台拆分", size=14, bold=True, color=PPT_COLOR_TEXT)
+
+    headers = ["平台", "营收", "订单", "客单价", "曝光人数", "进店人数", "下单转化"]
+    data = []
+    for _, r in plat_summary.iterrows():
+        data.append([
+            r["平台"],
+            f"¥{r['营收']:,.2f}",
+            f"{int(r['订单']):,}",
+            f"¥{r['客单价']:.2f}" if pd.notna(r['客单价']) else "—",
+            f"{int(r['曝光']):,}",
+            f"{int(r['进店']):,}",
+            f"{r['下单转化']*100:.1f}%" if pd.notna(r['下单转化']) else "—",
+        ])
+    _ppt_table(slide, 0.4, 3.7, 12.5, 1.6, headers, data)
+
+    # ── Slide 3：Top 5 门店 ─────────────────────────
+    slide = prs.slides.add_slide(blank)
+    _ppt_add_slide_header(slide, "🏆 营收 Top 5 门店",
+                           "今日表现最好的门店")
+
+    top5 = store_rank.head(5)
+    headers = ["排名", "门店", "平台", "营收", "订单"]
+    data = []
+    for i, (_, r) in enumerate(top5.iterrows(), 1):
+        data.append([
+            f"#{i}",
+            r["门店名称"],
+            r["平台"],
+            f"¥{r['营收']:,.2f}",
+            f"{int(r['订单']):,} 单",
+        ])
+    if data:
+        _ppt_table(slide, 0.4, 1.6, 12.5, 4, headers, data,
+                    header_color=PPT_COLOR_SUCCESS)
+    _ppt_textbox(slide, 0.4, 6.5, 12, 0.5,
+                 f"📌 Top 5 合计营收 ¥{top5['营收'].sum():,.2f}（占总营收 {top5['营收'].sum()/total_rev*100 if total_rev else 0:.1f}%）",
+                 size=12, color=PPT_COLOR_SUBTEXT)
+
+    # ── Slide 4：需关注门店 ─────────────────────────
+    slide = prs.slides.add_slide(blank)
+    _ppt_add_slide_header(slide, "⚠️ 需关注门店",
+                           "今日营收末位 + 异常门店")
+
+    bottom5 = store_rank.tail(5).sort_values("营收")
+    headers = ["排名", "门店", "平台", "营收", "订单"]
+    data = []
+    total_rank = len(store_rank)
+    for i, (_, r) in enumerate(bottom5.iterrows()):
+        rank_idx = total_rank - len(bottom5) + i + 1
+        data.append([
+            f"#{rank_idx}",
+            r["门店名称"],
+            r["平台"],
+            f"¥{r['营收']:,.2f}",
+            f"{int(r['订单']):,} 单",
+        ])
+    if data:
+        _ppt_table(slide, 0.4, 1.6, 12.5, 3.5, headers, data,
+                    header_color=PPT_COLOR_WARNING)
+
+    # ── Slide 5：预警汇总 ──────────────────────────
+    slide = prs.slides.add_slide(blank)
+    _ppt_add_slide_header(slide, "🚨 当日预警汇总",
+                           "指标异常 / 流量类型退化 / 退单率异常")
+
+    # 当日相关预警过滤
+    def _filter_today(df_, date_col="_date"):
+        if df_ is None or df_.empty or date_col not in df_.columns:
+            return df_ if df_ is not None else pd.DataFrame()
+        return df_[df_[date_col].dt.date == report_date]
+
+    a_today = _filter_today(alerts_df)
+    t_today = _filter_today(traffic_alerts)
+    r_today = _filter_today(refund_alerts)
+
+    # 3 个汇总卡片
+    sev_a = (a_today["严重度"].str.contains("严重").sum() if not a_today.empty else 0)
+    sev_t = (t_today["严重度"].str.contains("严重").sum() if not t_today.empty else 0)
+    sev_r = (r_today["严重度"].str.contains("严重").sum() if not r_today.empty else 0)
+
+    _ppt_kpi_card(slide, 0.4, 1.4, 4.1, 1.2, "指标异常",
+                   f"{len(a_today)} 条 / 严重 {sev_a}", PPT_COLOR_DANGER)
+    _ppt_kpi_card(slide, 4.7, 1.4, 4.1, 1.2, "流量类型退化",
+                   f"{len(t_today)} 条 / 严重 {sev_t}", PPT_COLOR_WARNING)
+    _ppt_kpi_card(slide, 9.0, 1.4, 4.1, 1.2, "退单率异常",
+                   f"{len(r_today)} 条 / 严重 {sev_r}", PPT_COLOR_DANGER)
+
+    # 严重预警明细表（合并三类，最多取 8 条）
+    severe_rows = []
+    for d, kind in [(a_today, "指标"), (t_today, "流量"), (r_today, "退单")]:
+        if d is None or d.empty:
+            continue
+        severe = d[d["严重度"].str.contains("严重")] if "严重度" in d.columns else d
+        for _, r in severe.iterrows():
+            store = r.get("门店", "")
+            plat  = r.get("平台", "")
+            if kind == "指标":
+                detail = f"{r.get('指标','')}：{r.get('当日值','')}（vs 历史 {r.get('历史均值','')}, {r.get('偏离','')}）"
+            elif kind == "流量":
+                detail = f"{r.get('类型','')}：{r.get('变化','')}"
+            else:
+                detail = f"{r.get('类型','')}：{r.get('退单率','')}（{int(r.get('无效订单数',0))} 单无效）"
+            severe_rows.append([kind, store, plat, detail])
+
+    if severe_rows:
+        _ppt_textbox(slide, 0.4, 2.9, 12, 0.4,
+                      "🔴 严重预警明细（最多展示 8 条）", size=14, bold=True,
+                      color=PPT_COLOR_DANGER)
+        _ppt_table(slide, 0.4, 3.4, 12.5, 3.5,
+                    ["类别", "门店", "平台", "详情"],
+                    severe_rows[:8],
+                    header_color=PPT_COLOR_DANGER)
+    else:
+        _ppt_textbox(slide, 0.4, 3.5, 12, 1,
+                      "✅ 今日未发现严重级别预警", size=20, bold=True,
+                      color=PPT_COLOR_SUCCESS, align=PP_ALIGN.CENTER)
+
+    # ── 保存 ───────────────────────────────────────
+    buf = io.BytesIO()
+    prs.save(buf)
+    buf.seek(0)
+    return buf
 
 
 # ── 侧边栏 ────────────────────────────────────────────────────────────────────
@@ -1627,14 +1962,44 @@ with tab4:
 
         st.dataframe(report_df, width='stretch', hide_index=True)
 
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            report_df.to_excel(writer, index=False, sheet_name=str(report_date))
-        buf.seek(0)
-        st.download_button(
-            label="⬇️ 下载日报 Excel",
-            data=buf.getvalue(),
-            file_name=f"日报_{report_date}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"dl_{report_date}",
-        )
+        # 下载按钮组
+        st.markdown('<div class="section-title">📥 导出日报</div>', unsafe_allow_html=True)
+        dl_c1, dl_c2 = st.columns(2)
+
+        with dl_c1:
+            # Excel
+            excel_buf = io.BytesIO()
+            with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+                report_df.to_excel(writer, index=False, sheet_name=str(report_date))
+            excel_buf.seek(0)
+            st.download_button(
+                label="📊 下载 Excel 日报",
+                data=excel_buf.getvalue(),
+                file_name=f"日报_{report_date}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_excel_{report_date}",
+                width='stretch',
+            )
+
+        with dl_c2:
+            # PPT - 实时生成（含当日预警）
+            try:
+                ppt_alerts = compute_alerts(df_all, z_thresh=z_thresh,
+                                             drop_thresh=drop_thresh,
+                                             monitor_metrics=monitor_metrics) if monitor_metrics else pd.DataFrame()
+                ppt_traffic = compute_traffic_type_alerts(df_all)
+                ppt_refund  = compute_refund_alerts(df_all)
+                ppt_buf = generate_ppt_report(df_all, report_date,
+                                                ppt_alerts, ppt_traffic, ppt_refund)
+                st.download_button(
+                    label="🎬 下载 PPT 日报",
+                    data=ppt_buf.getvalue(),
+                    file_name=f"日报_{report_date}.pptx",
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    key=f"dl_ppt_{report_date}",
+                    width='stretch',
+                )
+            except Exception as e:
+                st.error(f"PPT 生成失败：{e}")
+
+        st.caption("💡 PPT 日报包含 5 张幻灯片：封面、核心指标、Top 5 门店、需关注门店、预警汇总。可直接给老板看。")
