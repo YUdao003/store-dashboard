@@ -782,6 +782,161 @@ def compute_health_score(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("综合评分", ascending=False)
 
 
+# ── 到手率分析：数据处理函数 ──────────────────────────────────────────────────────
+
+def _rn(s):
+    return str(s).strip().replace('　', '').replace('\xa0', '')
+
+def _fc(df, *cands):
+    m = {_rn(c): c for c in df.columns}
+    for cand in cands:
+        cn = _rn(cand)
+        if cn in m:
+            return m[cn]
+        for k, v in m.items():
+            if cn in k:
+                return v
+    return None
+
+def _to_num(s):
+    return pd.to_numeric(s, errors='coerce').fillna(0)
+
+def rates_load_main(f):
+    df = pd.read_excel(f, engine='openpyxl')
+    df.columns = [_rn(c) for c in df.columns]
+    c2, cn, cs, cp = _fc(df, '末级分类'), _fc(df, '商品名称'), _fc(df, '商品规格'), _fc(df, '门店售卖价格')
+    miss = [n for n, c in [('末级分类', c2), ('商品名称', cn), ('门店售卖价格', cp)] if not c]
+    if miss:
+        raise ValueError(f"主表缺少必要列：{', '.join(miss)}")
+    has_spec = cs is not None
+    pdict = {}
+    for _, row in df.iterrows():
+        cat2, name = _rn(str(row[c2])), _rn(str(row[cn]))
+        spec = _rn(str(row[cs])) if has_spec else ''
+        v = row[cp]
+        if pd.isna(v):
+            continue
+        try:
+            price = float(v)
+        except (ValueError, TypeError):
+            continue
+        pdict[(cat2, name, spec) if has_spec else (cat2, name)] = price
+    return pdict, has_spec, len(pdict)
+
+def _rates_lookup(pdict, has_spec, cat2, name, spec):
+    c2n, nn, sn = _rn(str(cat2)), _rn(str(name)), _rn(str(spec))
+    if has_spec:
+        for k in [(c2n, nn, sn), (c2n, nn, '')]:
+            if k in pdict:
+                return pdict[k]
+        for k, v in pdict.items():
+            if k[0] == c2n and k[1] == nn:
+                return v
+    else:
+        k = (c2n, nn)
+        if k in pdict:
+            return pdict[k]
+    return None
+
+def rates_load_channel(f, pdict, has_spec, ch_name):
+    df = pd.read_excel(f, engine='openpyxl')
+    df.columns = [_rn(c) for c in df.columns]
+    c1 = _fc(df, '一级分类'); c2 = _fc(df, '末级分类'); cn = _fc(df, '商品名称')
+    cs = _fc(df, '商品规格'); cq = _fc(df, '销售数量'); co = _fc(df, '销售原价')
+    ca = _fc(df, '销售金额'); cd = _fc(df, '折扣金额')
+    if c1:
+        df = df[df[c1].astype(str).apply(_rn) == '成品'].copy()
+    df = df.reset_index(drop=True)
+    for col in [cq, co, ca, cd]:
+        if col:
+            df[col] = _to_num(df[col])
+    rows, unmatched = [], []
+    for _, row in df.iterrows():
+        cat2 = str(row.get(c2, '')); name = str(row.get(cn, ''))
+        spec = str(row.get(cs, '')) if cs else ''
+        qty = float(row[cq]) if cq else 0
+        orig = float(row[co]) if co else 0
+        sale = float(row[ca]) if ca else 0
+        disc = float(row[cd]) if cd else 0
+        door_price = _rates_lookup(pdict, has_spec, cat2, name, spec)
+        if door_price is not None:
+            real = door_price * qty
+            sys_r = sale / orig if orig > 0 else None
+            real_r = sale / real if real > 0 else None
+            prem = (orig - real) / real if real > 0 else None
+            ok = True
+        else:
+            real = sys_r = real_r = prem = None; ok = False
+            unmatched.append({'末级分类': _rn(cat2), '商品名称': _rn(name), '商品规格': _rn(spec)})
+        rows.append({'末级分类': _rn(cat2), '商品名称': _rn(name), '商品规格': _rn(spec),
+                     '销售数量': qty, '门店真实价': door_price, '销售原价': orig,
+                     '门店真实销售额': real, '实收金额': sale, '折扣金额': disc,
+                     '系统到手率': sys_r, '真实到手率': real_r, '溢价率': prem,
+                     '匹配': '✓' if ok else '✗'})
+    rdf = pd.DataFrame(rows)
+    tot_o = rdf['销售原价'].sum(); tot_s = rdf['实收金额'].sum()
+    tot_r = rdf['门店真实销售额'].dropna().sum(); tot_d = rdf['折扣金额'].sum()
+    n = len(rdf); nm = n - len(unmatched)
+    return rdf, {
+        'sku_count': n, 'matched_count': nm, 'unmatched': unmatched,
+        '销售数量': rdf['销售数量'].sum(), '系统销售原价': tot_o,
+        '门店真实销售额': tot_r, '实收金额': tot_s, '折扣金额': tot_d,
+        '系统到手率': tot_s / tot_o if tot_o > 0 else None,
+        '真实到手率': tot_s / tot_r if tot_r > 0 else None,
+        '溢价率': (tot_o - tot_r) / tot_r if tot_r > 0 else None,
+    }
+
+def rates_load_mp(f, delivery_fee):
+    df = pd.read_excel(f, engine='openpyxl')
+    df.columns = [_rn(c) for c in df.columns]
+    c_id = _fc(df, '订单流水号'); c_mt = _fc(df, '用餐方式'); c_ch = _fc(df, '订单渠道')
+    c_orig = _fc(df, '销售原价'); c_sale = _fc(df, '销售金额'); c_disc = _fc(df, '折扣金额')
+    c_prof = _fc(df, '销售利润'); c_dn = _fc(df, '折扣名称'); c_pay = _fc(df, '支付方式')
+    c_st = _fc(df, '门店名称'); c_tm = _fc(df, '订单时间')
+    removed = 0
+    if c_id:
+        mask = df[c_id].astype(str).apply(_rn) == '汇总'
+        removed = int(mask.sum()); df = df[~mask].copy()
+    if c_mt:
+        df = df[df[c_mt].astype(str).apply(_rn) == '外卖'].copy()
+    df = df.reset_index(drop=True)
+    warn = None
+    if c_ch and len(df) > 0:
+        bad = (df[c_ch].astype(str).apply(_rn) != '自营小程序').sum()
+        if bad > 0:
+            warn = f"⚠️ {bad} 行订单渠道不是「自营小程序」"
+    for col in [c_orig, c_sale, c_disc, c_prof]:
+        if col:
+            df[col] = _to_num(df[col])
+    ot = df[c_orig].sum() if c_orig else 0
+    st_ = df[c_sale].sum() if c_sale else 0
+    dt = df[c_disc].sum() if c_disc else 0
+    pt = df[c_prof].sum() if c_prof else 0
+    net = st_ - delivery_fee
+    cols = {}
+    if c_id: cols['订单流水号'] = df[c_id]
+    if c_st: cols['门店名称'] = df[c_st]
+    if c_mt: cols['用餐方式'] = df[c_mt]
+    if c_tm: cols['订单时间'] = df[c_tm]
+    if c_orig: cols['销售原价'] = df[c_orig]
+    if c_sale: cols['实收金额'] = df[c_sale]
+    if c_disc: cols['折扣金额'] = df[c_disc]
+    if c_dn: cols['折扣名称'] = df[c_dn]
+    if c_pay: cols['支付方式'] = df[c_pay]
+    return pd.DataFrame(cols) if cols else pd.DataFrame(), {
+        'order_count': len(df), 'removed': removed, 'warning': warn,
+        '系统销售原价': ot, '门店真实销售额': ot,
+        '实收金额(毛)': st_, '配送费': delivery_fee, '净实收': net,
+        '折扣金额': dt, '利润合计': pt,
+        '毛到手率': st_ / ot if ot > 0 else None,
+        '净到手率': net / ot if ot > 0 else None,
+        '实收金额': net,
+        '系统到手率': net / ot if ot > 0 else None,
+        '真实到手率': net / ot if ot > 0 else None,
+        '溢价率': 0.0,
+    }
+
+
 def generate_daily_report(df, report_date) -> pd.DataFrame:
     day = df[df["日期"] == pd.Timestamp(report_date)]
     if day.empty:
@@ -1254,10 +1409,10 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-tab1, tab2, tab3, tab_profit, tab_peer, tab_health, tab_alert, tab4 = st.tabs(
+tab1, tab2, tab3, tab_profit, tab_peer, tab_health, tab_alert, tab4, tab_rates = st.tabs(
     ["📈 综合概览", "🏪 门店分析", "👥 流量分析",
      "💰 利润分析", "🎯 大盘对比", "⭐ 健康度",
-     "⚠️ 预警监控", "📋 日报"]
+     "⚠️ 预警监控", "📋 日报", "💸 到手率分析"]
 )
 
 # ── Tab 1: 综合概览 ───────────────────────────────────────────────────────────
@@ -2003,3 +2158,208 @@ with tab4:
                 st.error(f"PPT 生成失败：{e}")
 
         st.caption("💡 PPT 日报包含 5 张幻灯片：封面、核心指标、Top 5 门店、需关注门店、预警汇总。可直接给老板看。")
+
+
+# ── Tab 到手率分析 ────────────────────────────────────────────────────────────
+with tab_rates:
+    st.markdown('<div class="section-title">数据文件配置</div>', unsafe_allow_html=True)
+
+    # 支持通过环境变量设置默认数据文件夹，实现"放进去自动读"
+    _RATES_DEFAULT_DIR = os.environ.get("RATES_DATA_DIR", "")
+
+    with st.expander("📁 文件配置", expanded=True):
+        ra_col1, ra_col2 = st.columns([2, 1])
+        with ra_col1:
+            ra_dir = st.text_input(
+                "数据文件夹路径（配置后自动读取，留空则手动上传）",
+                value=_RATES_DEFAULT_DIR, key="ra_dir",
+                help="把 4 个 Excel 文件放到同一文件夹，填入路径后刷新页面即可自动加载。",
+            )
+        with ra_col2:
+            ra_month = st.text_input("月份标签（用于报告标题）", value="2026-04", key="ra_month")
+            ra_delivery = st.number_input(
+                "小程序配送费（元）", min_value=0.0, value=0.0, step=0.01, key="ra_delivery",
+                help="当月小程序外卖配送费总额，在汇总层面整体扣减。",
+            )
+
+        up_c1, up_c2, up_c3, up_c4 = st.columns(4)
+        with up_c1:
+            ra_main_up = st.file_uploader("主表（含门店价）", type=["xlsx", "xls"], key="ra_main_up")
+            ra_main_name = st.text_input("文件名", value="主表.xlsx", key="ra_main_name", label_visibility="collapsed")
+        with up_c2:
+            ra_mt_up = st.file_uploader("美团渠道表", type=["xlsx", "xls"], key="ra_mt_up")
+            ra_mt_name = st.text_input("文件名", value="美团.xlsx", key="ra_mt_name", label_visibility="collapsed")
+        with up_c3:
+            ra_ele_up = st.file_uploader("饿了么渠道表", type=["xlsx", "xls"], key="ra_ele_up")
+            ra_ele_name = st.text_input("文件名", value="饿了么.xlsx", key="ra_ele_name", label_visibility="collapsed")
+        with up_c4:
+            ra_mp_up = st.file_uploader("小程序订单流水", type=["xlsx", "xls"], key="ra_mp_up")
+            ra_mp_name = st.text_input("文件名", value="小程序.xlsx", key="ra_mp_name", label_visibility="collapsed")
+
+    def _ra_src(upload, folder, name):
+        if upload is not None:
+            return upload
+        if folder:
+            p = os.path.join(folder, name)
+            if os.path.exists(p):
+                return p
+        return None
+
+    ra_main_src = _ra_src(ra_main_up, ra_dir, ra_main_name)
+    ra_mt_src   = _ra_src(ra_mt_up,   ra_dir, ra_mt_name)
+    ra_ele_src  = _ra_src(ra_ele_up,  ra_dir, ra_ele_name)
+    ra_mp_src   = _ra_src(ra_mp_up,   ra_dir, ra_mp_name)
+
+    ra_missing = [n for n, s in [("主表", ra_main_src), ("美团", ra_mt_src),
+                                  ("饿了么", ra_ele_src), ("小程序", ra_mp_src)] if s is None]
+    if ra_missing:
+        st.info(f"👆 请上传或配置数据文件夹路径，缺少：{', '.join(ra_missing)}")
+        st.caption("提示：把 4 个 Excel 文件放到同一文件夹，在上方填入路径，每次更新文件后刷新页面即自动加载。")
+    else:
+        def _fp(v):
+            return f"{v * 100:.2f}%" if v is not None else "-"
+
+        def _fm(v):
+            return f"¥{v:,.2f}" if v is not None else "-"
+
+        with st.spinner("正在读取并计算..."):
+            ra_msgs, ra_errs = [], []
+            ra_ok = False
+            try:
+                pdict, has_spec, main_n = rates_load_main(ra_main_src)
+                ra_msgs.append(("✅", f"主表读取成功，共 {main_n} 个 SKU{'（含规格）' if has_spec else '（无规格列）'}"))
+
+                mt_df, mt_s = rates_load_channel(ra_mt_src, pdict, has_spec, "美团")
+                n_mt, nm_mt = mt_s['sku_count'], mt_s['matched_count']
+                icon_mt = "✅" if not mt_s['unmatched'] else "⚠️"
+                ra_msgs.append((icon_mt, f"美团渠道：{n_mt} 个成品 SKU，门店价匹配率 {nm_mt/n_mt*100:.0f}%" if n_mt else "美团：无成品 SKU"))
+
+                ele_df, ele_s = rates_load_channel(ra_ele_src, pdict, has_spec, "饿了么")
+                n_el, nm_el = ele_s['sku_count'], ele_s['matched_count']
+                icon_el = "✅" if not ele_s['unmatched'] else "⚠️"
+                ra_msgs.append((icon_el, f"饿了么渠道：{n_el} 个成品 SKU，门店价匹配率 {nm_el/n_el*100:.0f}%" if n_el else "饿了么：无成品 SKU"))
+
+                mp_df, mp_s = rates_load_mp(ra_mp_src, float(ra_delivery))
+                ra_msgs.append(("✅", f"小程序：{mp_s['order_count']} 笔外卖订单，已剔除 {mp_s['removed']} 行汇总数据"))
+                if mp_s.get('warning'):
+                    ra_msgs.append(("⚠️", mp_s['warning']))
+
+                t_orig = mt_s['系统销售原价'] + ele_s['系统销售原价'] + mp_s['系统销售原价']
+                t_real = mt_s['门店真实销售额'] + ele_s['门店真实销售额'] + mp_s['门店真实销售额']
+                t_recv = mt_s['实收金额'] + ele_s['实收金额'] + mp_s['净实收']
+                ov = {
+                    '系统销售原价': t_orig, '门店真实销售额': t_real, '实收金额': t_recv,
+                    '系统到手率': t_recv / t_orig if t_orig > 0 else None,
+                    '真实到手率': t_recv / t_real if t_real > 0 else None,
+                    '溢价率': (t_orig - t_real) / t_real if t_real > 0 else None,
+                }
+                ra_ok = True
+            except Exception as e:
+                ra_errs.append(str(e))
+
+        for icon, msg in ra_msgs:
+            if icon == "✅":
+                st.success(msg)
+            else:
+                st.warning(msg)
+        for err in ra_errs:
+            st.error(err)
+
+        if ra_ok:
+            # ── 概览卡片 ──────────────────────────────────────────────────────
+            st.markdown(f'<div class="section-title">{ra_month} 到手率概览</div>', unsafe_allow_html=True)
+            rc1, rc2, rc3, rc4 = st.columns(4)
+
+            def _ra_card(col, label, main, subs):
+                col.markdown(
+                    f"""<div class="metric-card">
+                    <div class="metric-label">{label}</div>
+                    <div class="metric-value">{main}</div>
+                    {''.join(f'<div class="metric-sub">{s}</div>' for s in subs)}
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+
+            _ra_card(rc1, f"{ra_month} 整体 真实到手率", _fp(ov['真实到手率']),
+                     [f"系统到手率: {_fp(ov['系统到手率'])}", f"溢价率: {_fp(ov['溢价率'])}", f"实收: {_fm(ov['实收金额'])}"])
+            _ra_card(rc2, "美团 真实到手率", _fp(mt_s['真实到手率']),
+                     [f"系统到手率: {_fp(mt_s['系统到手率'])}", f"溢价率: {_fp(mt_s['溢价率'])}", f"成品SKU: {mt_s['sku_count']}"])
+            _ra_card(rc3, "饿了么 真实到手率", _fp(ele_s['真实到手率']),
+                     [f"系统到手率: {_fp(ele_s['系统到手率'])}", f"溢价率: {_fp(ele_s['溢价率'])}", f"成品SKU: {ele_s['sku_count']}"])
+            _ra_card(rc4, "小程序 净到手率（扣配送）", _fp(mp_s['净到手率']),
+                     [f"毛到手率: {_fp(mp_s['毛到手率'])}", f"配送费: {_fm(mp_s['配送费'])}", f"订单数: {mp_s['order_count']}"])
+
+            # ── 分渠道汇总表 ──────────────────────────────────────────────────
+            st.markdown('<div class="section-title">分渠道汇总</div>', unsafe_allow_html=True)
+            ch_rows = []
+            for ch_name, s, qty_label in [
+                ("美团",   mt_s,  f"{mt_s['销售数量']:.0f} 件"),
+                ("饿了么", ele_s, f"{ele_s['销售数量']:.0f} 件"),
+                ("小程序", mp_s,  f"{mp_s['order_count']} 单"),
+            ]:
+                recv_disp = (_fm(s['净实收']) + " (扣配送)") if ch_name == "小程序" else _fm(s['实收金额'])
+                ch_rows.append({
+                    "渠道": ch_name, "数量/订单": qty_label,
+                    "系统销售原价": _fm(s['系统销售原价']),
+                    "门店真实销售额": _fm(s['门店真实销售额']),
+                    "实收金额": recv_disp,
+                    "折扣金额": _fm(s['折扣金额']),
+                    "系统到手率": _fp(s['系统到手率']),
+                    "真实到手率": _fp(s['真实到手率']),
+                    "溢价率": _fp(s['溢价率']),
+                })
+            ch_rows.append({
+                "渠道": "合计", "数量/订单": "-",
+                "系统销售原价": _fm(ov['系统销售原价']),
+                "门店真实销售额": _fm(ov['门店真实销售额']),
+                "实收金额": _fm(ov['实收金额']),
+                "折扣金额": "-",
+                "系统到手率": _fp(ov['系统到手率']),
+                "真实到手率": _fp(ov['真实到手率']),
+                "溢价率": _fp(ov['溢价率']),
+            })
+            st.dataframe(pd.DataFrame(ch_rows), hide_index=True, use_container_width=True)
+
+            # ── SKU / 订单明细 ────────────────────────────────────────────────
+            st.markdown('<div class="section-title">明细数据</div>', unsafe_allow_html=True)
+            rt1, rt2, rt3 = st.tabs(["🛵 美团 SKU", "🟡 饿了么 SKU", "📱 小程序订单"])
+
+            def _show_ch_detail(tab, df, summ):
+                with tab:
+                    if summ['unmatched']:
+                        names = "；".join(f"{u['末级分类']}/{u['商品名称']}" for u in summ['unmatched'])
+                        st.warning(f"以下 SKU 未匹配到门店价（将影响真实到手率计算）：{names}")
+                    disp = df.copy()
+                    for col in ['系统到手率', '真实到手率', '溢价率']:
+                        if col in disp.columns:
+                            disp[col] = disp[col].apply(lambda v: _fp(v) if pd.notna(v) else "-")
+                    st.dataframe(disp, hide_index=True, use_container_width=True, height=420)
+
+            _show_ch_detail(rt1, mt_df, mt_s)
+            _show_ch_detail(rt2, ele_df, ele_s)
+
+            with rt3:
+                st.caption(
+                    f"毛到手率: **{_fp(mp_s['毛到手率'])}**  |  "
+                    f"配送费: **{_fm(mp_s['配送费'])}**  |  "
+                    f"净实收: **{_fm(mp_s['净实收'])}**  |  "
+                    f"净到手率: **{_fp(mp_s['净到手率'])}**"
+                )
+                st.dataframe(mp_df, hide_index=True, use_container_width=True, height=420)
+
+            # ── 导出 Excel ────────────────────────────────────────────────────
+            st.markdown('<div class="section-title">📥 导出 Excel 报告</div>', unsafe_allow_html=True)
+            ra_excel_buf = io.BytesIO()
+            with pd.ExcelWriter(ra_excel_buf, engine='openpyxl') as writer:
+                pd.DataFrame(ch_rows).to_excel(writer, index=False, sheet_name="渠道汇总")
+                mt_df.to_excel(writer, index=False, sheet_name=f"{ra_month}美团")
+                ele_df.to_excel(writer, index=False, sheet_name=f"{ra_month}饿了么")
+                mp_df.to_excel(writer, index=False, sheet_name=f"{ra_month}小程序(外卖)")
+            ra_excel_buf.seek(0)
+            st.download_button(
+                label="📊 下载 Excel 报告",
+                data=ra_excel_buf.getvalue(),
+                file_name=f"到手率分析_{ra_month}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="ra_dl_excel",
+            )
